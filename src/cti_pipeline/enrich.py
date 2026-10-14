@@ -4,6 +4,8 @@ The enricher replays a time-ordered flow stream against a feed that is polled
 every ``interval_s`` seconds:
 
 * an IoC sighting becomes visible at the first poll boundary at/after it;
+* a flow is only evaluated against boundaries strictly before its own
+  timestamp, so no flow can be flagged by the sighting it produced itself;
 * an indicator expires if no sighting landed within the TTL window;
 * ``feed_age_score = 0.5 ** (age / half_life)`` encodes freshness decay.
 
@@ -60,6 +62,15 @@ def build_sightings(
 ) -> tuple[dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]], dict]:
     """Merge live-feed IoCs and (optionally) injected ground-truth IoCs.
 
+    ``flows`` is the **label source** for the injected indicator set.  When
+    ``injection == "controlled"`` it must contain training/validation rows
+    only - never the test split.  The set of IPs that become IoCs, their
+    sighting timestamps, and the synthetic confidence/corroboration model are
+    all derived from ``label``, so feeding the whole frame in would make each
+    test flow's CTI features a function of its own ground truth.  The
+    experiment helpers enforce this (``_common.get_sightings`` raises if the
+    caller omits the restriction); this function stays a plain primitive.
+
     Returns {value: (times, confidences, source_counts)} sorted by time plus a
     provenance summary.
     """
@@ -75,8 +86,12 @@ def build_sightings(
         mal_set = set(mal_ips)
         benign_ips = np.array([i for i in benign_ips if i not in mal_set], dtype=object)
 
-        selected = set(rng.choice(mal_ips, size=max(1, int(len(mal_ips) * injection_rate)),
-                                  replace=False).tolist())
+        selected = set()
+        if len(mal_ips):
+            # max(1, ...) alone raises when there are no malicious rows at all
+            take = min(len(mal_ips), max(1, int(len(mal_ips) * injection_rate)))
+            selected = set(rng.choice(mal_ips, size=take,
+                                      replace=False).tolist())
         noise = set()
         if benign_ioc_rate > 0 and len(benign_ips):
             take = max(1, int(len(benign_ips) * benign_ioc_rate))
@@ -163,11 +178,14 @@ def _endpoint_state(
             continue
         t = ts[rows]
         s_times, s_conf, s_srcs = sightings[value]
-        # a sighting becomes visible AT its poll boundary: search over poll
-        # times (not raw sighting times) so the flow's own sighting - whose
-        # boundary lies in the future - can never leak into the features.
+        # a sighting becomes visible AT its poll boundary; a flow only sees
+        # boundaries strictly BEFORE its own timestamp (side="left"), so a
+        # label-derived sighting whose boundary lands exactly on the flow's
+        # own time - which happens when the timestamp sits on a poll
+        # boundary, because poll_grid rounds with ceil - cannot flag the very
+        # flow that produced it.
         poll_times = poll_grid(s_times, settings)
-        k = np.searchsorted(poll_times, t, side="right") - 1
+        k = np.searchsorted(poll_times, t, side="left") - 1
         valid = k >= 0
         if not valid.any():
             continue

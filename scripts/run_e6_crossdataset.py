@@ -30,11 +30,11 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import (  # noqa: E402
     TABLES, base_parser, build_enriched, get_config, get_flows, get_live_records,
-    write_json,
+    split_first, write_json,
 )
 
 from cti_pipeline.enrich import CTI_FEATURES  # noqa: E402
-from cti_pipeline.model import fit_and_score, make_splits, metrics_at  # noqa: E402
+from cti_pipeline.model import fit_and_score, metrics_at  # noqa: E402
 
 RATES = ("byte_rate", "pkt_rate", "iat_mean", "mean_pkt_size", "duration_s",
          "total_pkts", "total_bytes", "fwd_bwd_ratio")
@@ -112,12 +112,21 @@ def main() -> None:
     live = get_live_records(cfg, poll=not args.no_poll)
 
     designs: dict[str, tuple[pd.DataFrame, np.ndarray]] = {}
+    splits_by: dict[str, object] = {}
     for name in ("unsw_nb15", "cicids2017"):
         t0 = time.time()
         flows = get_flows(cfg, name)
-        frame, _, _ = build_enriched(cfg, flows, live, interval_min=cfg.cti.poll_interval_min)
+        # split before enrichment: injected indicators come from train+val
+        # labels only, so no test split (source or target) leaks into the CTI
+        # features - the cross-direction evaluation therefore never sees a
+        # target label that was used to build the indicator pool.
+        splits_d, _, eligible = split_first(cfg, flows)
+        frame, _, _ = build_enriched(cfg, flows, live,
+                                     interval_min=cfg.cti.poll_interval_min,
+                                     eligible=eligible)
         X, y = canonical(frame, name)
         designs[name] = (X.reset_index(drop=True), y)
+        splits_by[name] = splits_d
         print(f"[e6] {name}: canonical design {X.shape} in {time.time()-t0:.0f}s "
               f"(cols={list(X.columns)})", flush=True)
 
@@ -141,8 +150,8 @@ def main() -> None:
         t0 = time.time()
         Xs, ys = designs[src]
         Xt, yt = designs[tgt]
-        split_s = make_splits(ys, cfg.data.test_size, cfg.data.val_size, cfg.model.seed)
-        split_t = make_splits(yt, cfg.data.test_size, cfg.data.val_size, cfg.model.seed)
+        split_s = splits_by[src]
+        split_t = splits_by[tgt]
 
         model_src, cross_test = fit_and_score(
             Xs.iloc[split_s.train], ys[split_s.train],

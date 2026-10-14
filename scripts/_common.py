@@ -8,6 +8,8 @@ import sys
 import time
 from pathlib import Path
 
+import numpy as np
+
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 if str(SRC) not in sys.path:
@@ -63,7 +65,14 @@ def get_flows(cfg: Config, name: str) -> "data_mod.pd.DataFrame":
 
 
 def get_sighting_frame(cfg: Config, name: str):
-    """Full un-subsampled (src_ip, dst_ip, ts, label) frame used for feed visibility."""
+    """Full un-subsampled (src_ip, dst_ip, ts, label) frame.
+
+    Historical note: this used to be the label source for controlled
+    injection.  It is not split-aware, so using it would build the IoC set
+    from test-split labels (target leakage).  The experiments now take their
+    labels from ``split_first(...).eligible`` only; this loader is retained
+    for offline inspection and must not be used to derive indicators.
+    """
     PROCESSED.mkdir(parents=True, exist_ok=True)
     cache = PROCESSED / f"{name}_sightings.parquet"
     if cache.exists():
@@ -108,17 +117,52 @@ def make_settings(interval_min: float, cfg: Config) -> ReplaySettings:
 
 
 def get_sightings(cfg: Config, flows, live_records: list[IocRecord],
-                  injection: str | None = None):
-    """Build (cache-free) IoC sighting timeline from the *full* traffic frame."""
+                  injection: str | None = None, eligible=None):
+    """Build the IoC sighting timeline.
+
+    ``eligible`` is the set of rows allowed to contribute **label-derived**
+    indicators - it must be the train+validation split.  Omitting it would
+    build the injected IoC set (IPs, timestamps, synthetic confidence) from
+    the ground-truth labels of *every* row, including the test split, so each
+    test flow would carry CTI features computed from its own label.  That is
+    target leakage, so controlled injection without ``eligible`` raises
+    instead of silently falling back to the full frame.
+
+    The un-subsampled sighting frame is no longer used as a label source: it
+    has no split information, so it cannot be made leak-free.
+    """
     injection = cfg.replay.injection if injection is None else injection
-    name = str(flows["dataset"].iloc[0])
-    sight_frame = get_sighting_frame(cfg, name)
+    if injection == "controlled":
+        if eligible is None:
+            raise ValueError(
+                "controlled injection derives IoCs from ground-truth labels; "
+                "pass eligible=<train+val rows> so test-split labels cannot "
+                "leak into the CTI features (see docs/METHODOLOGY.md)")
+        source = eligible
+    else:
+        source = flows.iloc[0:0]        # no label-derived indicators at all
     return build_sightings(
-        sight_frame, live_records, injection=injection,
+        source, live_records, injection=injection,
         injection_rate=cfg.replay.injection_rate,
         benign_ioc_rate=cfg.replay.benign_ioc_rate,
         seed=cfg.replay.seed,
     )
+
+
+def split_first(cfg: Config, flows):
+    """Split **before** enrichment, and derive the indicator pool from it.
+
+    Returns ``(splits, y, eligible)`` where ``eligible`` are the
+    train+validation rows.  Enrichment has to be given this subset: the
+    split must exist first, otherwise the injected IoC set is built from the
+    test-split labels (target leakage - see ``get_sightings``).
+    """
+    from cti_pipeline.model import make_splits
+
+    y = flows["label"].to_numpy()
+    splits = make_splits(y, cfg.data.test_size, cfg.data.val_size, cfg.model.seed)
+    eligible = flows.iloc[np.concatenate([splits.train, splits.val])]
+    return splits, y, eligible
 
 
 def build_enriched(
@@ -128,10 +172,17 @@ def build_enriched(
     interval_min: float = 5.0,
     injection: str | None = None,
     sightings=None,
+    eligible=None,
 ):
-    """Enrich flows at a given poll interval; return (frame_with_cti, sightings, summary)."""
+    """Enrich flows at a given poll interval; return (frame_with_cti, sightings, summary).
+
+    Pass ``eligible`` (see ``split_first``) whenever ``injection`` is the
+    controlled one - it is required for that path.
+    """
     if sightings is None:
-        sightings, summary = get_sightings(cfg, flows, live_records, injection=injection)
+        sightings, summary = get_sightings(cfg, flows, live_records,
+                                           injection=injection,
+                                           eligible=eligible)
         sightings_map = sightings
     elif isinstance(sightings, tuple):
         sightings_map, summary = sightings[0], sightings[1]

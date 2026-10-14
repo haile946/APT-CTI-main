@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import shap
 
-from _common import base_parser, build_enriched, get_config, get_flows, get_live_records
+from _common import base_parser, build_enriched, get_config, get_flows, get_live_records, split_first
 from cti_pipeline.data import build_design
 from cti_pipeline.enrich import CTI_FEATURES
 from cti_pipeline.model import make_model
@@ -22,7 +22,10 @@ cfg = get_config(args)
 
 flows = get_flows(cfg, args.dataset)
 live = get_live_records(cfg, poll=not args.no_poll)
-frame, _, _ = build_enriched(cfg, flows, live, interval_min=cfg.cti.poll_interval_min)
+# controlled injection needs a leak-free label source (train+val rows)
+_, _, eligible = split_first(cfg, flows)
+frame, _, _ = build_enriched(cfg, flows, live, interval_min=cfg.cti.poll_interval_min,
+                             eligible=eligible)
 X, y = build_design(frame, include_cti=True, cti_cols=CTI_FEATURES)
 print(f"rows={len(X):,} feats={X.shape[1]}")
 

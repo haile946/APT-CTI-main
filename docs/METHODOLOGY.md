@@ -65,15 +65,16 @@ Pollers are **fail-soft**: a failing feed is recorded in `results/tables/feed_po
 Flows are replayed in timestamp order against a feed polled every Δ seconds:
 
 1. An IoC sighting becomes visible from the **first poll boundary at or after** the sighting time.  
-2. It expires when no sighting lands within `replay.ttl_hours`.  
-3. Per-flow age score:
+2. A flow is affected only by boundaries **strictly earlier** than its own timestamp, so a flow can never be flagged by a sighting it caused itself (including when its timestamp happens to sit exactly on a poll boundary).  
+3. It expires when no sighting lands within `replay.ttl_hours`.  
+4. Per-flow age score:
 
    \[
    \text{feed\_age\_score} = 0.5^{\,\text{age} / h_{1/2}}
    \]
 
    where age is measured from the **poll boundary** (not the raw sighting), and \(h_{1/2}\) = `freshness_half_life_h` (default 6 h).  
-4. Poll grid origin \(t_0\) is aligned to the start of the replay.
+5. Poll grid origin \(t_0\) is aligned to the start of the replay.
 
 ### 3.4 Per-flow CTI feature group
 
@@ -105,11 +106,25 @@ CIC-IDS2017 and UNSW-NB15 were collected years before the live feeds used here. 
 
 Configuration: `replay.injection: controlled | none`.
 
+Both provenances are merged per indicator value; the overlap between them is measured and reported rather than hidden.
+
 ### 4.3 Interpretation rules
 
 - Injected rows quantify **what accurate intelligence can buy** under documented coverage — an upper-bound-style estimate.  
-- `live_feeds_only` (traffic-only under current feeds) quantifies **what today’s feeds actually deliver** on the benchmark.  
+- `live_feeds_only` (traffic plus the six CTI features computed from **live-feed sightings alone**, no injection) quantifies **what today’s feeds actually deliver** on the benchmark.  
 - Both rows are written to the same result tables so the gap is visible and cannot be suppressed in reporting.
+
+### 4.4 Leak control: the indicator pool is split-restricted
+
+Injected indicators are a deterministic function of ground truth, so the *choice of rows* they are derived from is a validity-critical parameter:
+
+1. `split_first()` computes train / validation / test **before** any enrichment runs.
+2. `_common.get_sightings(..., eligible=...)` builds every label-derived quantity — the injected IP pool, the sighting timeline, the synthetic confidence and corroboration model, and the benign-noise pool — from **train + validation rows only**.
+3. Test-split labels therefore never influence a feature of a test row. A flow may still match an indicator, but only if that IP was published from *other* (training-time) flows, which is exactly the signal the system is meant to learn.
+4. Omitting `eligible` raises `ValueError` rather than silently falling back to the full frame.
+5. `_common.get_sighting_frame()` (the un-subsampled frame cache) is **not** a valid label source: it carries no split information and is retained only for offline inspection.
+
+Regression coverage: `tests/test_leakage.py` (10 checks) — including a fixture where an IP appears exclusively in test rows and must never reach the indicator pool, and a perturbation test proving that flipping only test labels leaves all six CTI features unchanged.
 
 ---
 
@@ -182,12 +197,13 @@ Gates: `attribution.min_notify` (default 0.25), specificity (limited close compe
 
 ## 10. Threats to validity (design-level)
 
-1. **Label-derived injection** can overstate live-feed performance; mitigated by mandatory `live_feeds_only` rows.  
-2. **Benchmark age** — 2017-era labels do not represent current threat landscapes.  
-3. **Feed drift** — public lists change; historical re-runs may differ.  
-4. **Linear SVM** may be a weak comparator at this operating point; retained as proposal baseline.  
-5. **Actor attribution** is evidence-based ranking, not ground-truth evaluation.  
-6. **E6 bridge is narrow** (18 features) by construction — bounds portability, does not negate in-domain E1–E5.
+1. **Label-derived injection** can overstate live-feed performance; mitigated by mandatory `live_feeds_only` rows **and** by §4.4 — the indicator pool is built from train+validation rows only, so test labels never reach the features.  
+2. **Preprocessing is fitted once on all of train+validation** (indicator pool, categorical keep-sets), so *inner* CV folds share it: inner-fold scores are mildly optimistic. The held-out test split is untouched by this.  
+3. **Benchmark age** — 2017-era labels do not represent current threat landscapes.  
+4. **Feed drift** — public lists change; historical re-runs may differ.  
+5. **Linear SVM** may be a weak comparator at this operating point; retained as proposal baseline.  
+6. **Actor attribution** is evidence-based ranking, not ground-truth evaluation.  
+7. **E6 bridge is narrow** (18 features) by construction — bounds portability, does not negate in-domain E1–E5.
 
 Further discussion: [`RESULTS.md`](RESULTS.md).
 

@@ -12,10 +12,11 @@ import numpy as np
 
 from _common import (  # noqa: E402
     base_parser, build_enriched, get_config, get_flows, get_live_records, get_sightings,
+    split_first,
 )
 from cti_pipeline.data import build_design  # noqa: E402
 from cti_pipeline.enrich import CTI_FEATURES, coverage_stats  # noqa: E402
-from cti_pipeline.model import make_model, make_splits, metrics_at, tune_threshold  # noqa: E402
+from cti_pipeline.model import make_model, metrics_at, tune_threshold  # noqa: E402
 
 parser = base_parser("E3 collapse diagnostic")
 parser.add_argument("--no-poll", action="store_true")
@@ -25,12 +26,13 @@ cfg = get_config(args)
 
 flows = get_flows(cfg, args.dataset)
 live = get_live_records(cfg, poll=not args.no_poll)
-sightings, summary = get_sightings(cfg, flows, live)
+# split first: injected IoCs may only come from train+val labels
+splits, y, eligible = split_first(cfg, flows)
+sightings, summary = get_sightings(cfg, flows, live, eligible=eligible)
 
 frame_ref, _, _ = build_enriched(cfg, flows, live, interval_min=cfg.cti.poll_interval_min,
                                  sightings=(sightings, summary))
 X, y = build_design(frame_ref, include_cti=True, cti_cols=CTI_FEATURES)
-splits = make_splits(y, cfg.data.test_size, cfg.data.val_size, cfg.model.seed)
 
 model = make_model(cfg)
 model.fit(X.iloc[splits.train], y[splits.train])

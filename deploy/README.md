@@ -366,9 +366,12 @@ flush. Throughput is bound by SHAP, not the model.
 
 - **Train/serve skew**: category vocabularies are frozen (`OTHER`/`UNK`
   pooling); unseen sensors values degrade gracefully, not for free.
-- **CTI features**: trained with controlled injection (0.6 % of benign rows);
-  at runtime they come from real feeds only (`injection: none`), and the offline
-  corpus drifts — live feeds are fresher but noisier.
+- **CTI features**: trained with controlled injection (60 % of
+  malicious-flow IPs published as indicators, plus 0.4 % benign-only noise),
+  with the indicator pool built from the **train+validation** split only —
+  never from the held-out test labels. At runtime they come from real feeds
+  only (`injection: none`), and the offline corpus drifts — live feeds are
+  fresher but noisier.
 - **Metrics are offline** (UNSW-NB15 held-out). Production traffic is
   unlabeled: expect the FPR, not the accuracy, to be the number you feel.
 - Single node, file-tail input (no Kafka/multi-tenant); webhook auth is a

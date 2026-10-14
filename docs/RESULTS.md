@@ -12,6 +12,13 @@ Machine-readable sources of truth:
 
 Experimental scale (unless noted): **400 000 flows/dataset**, RF **200** trees, `min_samples_leaf=20`, seed **42**, operating recall target **0.96**.
 
+> **Provenance — read before quoting any figure below.** These tables were produced **before** two methodology fixes landed in this repository:
+>
+> 1. **Split-restricted injection** (`scripts/_common.py`, `docs/METHODOLOGY.md` §4.4). The injected indicator pool was previously built from the *entire* labelled frame, test rows included, so test labels could influence test features. The pool is now built from train+validation rows only, and a flow can no longer be flagged by its own sighting.
+> 2. **`live_feeds_only` variant** (`scripts/run_e2_ablation.py`). The variant dropped all six CTI columns, so its metrics are a duplicate of `traffic_only` rather than a measurement of live-feed contribution.
+>
+> Every number below is therefore an **upper bound** produced by the pre-fix pipeline. Re-run E1–E6 with the fixed code (`python tests/test_leakage.py` must pass first) to refresh all tables, figures and verdicts.
+
 ---
 
 ## 1. E1 — Baseline reproduction
@@ -52,7 +59,7 @@ Detailed metrics: `results/tables/e1_baseline_*.json`.
 | Condition | UNSW-NB15 | CIC-IDS2017 |
 |-----------|----------:|------------:|
 | `traffic_cti_no_match` (IoC-match flags removed) | 2.2 % reduction | still **97.6 %** |
-| `live_feeds_only` (today’s feeds, no injection) | ~0 indicator overlap | ~0 indicator overlap |
+| `live_feeds_only` (traffic + CTI from today’s feeds, no injection) | ~0 indicator overlap | ~0 indicator overlap |
 
 **Interpretation**
 
@@ -146,13 +153,16 @@ Both datasets mapped to an identical **18-feature canonical bridge** (same formu
 3. **`min_samples_leaf=20`** (instead of 2) was chosen for TreeSHAP tractability at 400 k rows (E4 runtime ~176 min → ~4 min). It regularises every model in the suite equally.  
 4. **E6’s bridge is deliberately narrow** (18 features): the benchmarks share almost no raw columns. Transport bounds portability; it does not contradict in-domain E1–E5.  
 5. **No APT actor ground truth** in either traffic benchmark — attribution is evidence-based ranking.  
-6. **Feed drift** — re-running live polls years later may change `live_feeds_only` behaviour.
+6. **Feed drift** — re-running live polls years later may change `live_feeds_only` behaviour.  
+7. **Provenance** — the tables quoted in this document were produced *before* the split-restriction and `live_feeds_only` fixes; see the notice at the top of this document and `results/tables/PROVENANCE.md`. Quote them only as an upper bound until E1–E6 are re-run.
 
 ---
 
 ## 9. Reproducing these tables
 
 ```bash
+python tests/test_leakage.py        # methodology gate — must pass 10/10
+python deploy/test_hardening.py     # service gate — must pass 51/51
 python scripts/status_report.py
 # or full suite:
 powershell -File run_all.ps1          # Windows

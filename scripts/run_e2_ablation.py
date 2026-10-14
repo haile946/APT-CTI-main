@@ -18,12 +18,13 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import (  # noqa: E402
-    TABLES, base_parser, build_enriched, get_config, get_flows, get_live_records, write_json,
+    TABLES, base_parser, build_enriched, get_config, get_flows, get_live_records,
+    split_first, write_json,
 )
 
 from cti_pipeline.data import build_design  # noqa: E402
 from cti_pipeline.enrich import CTI_FEATURES  # noqa: E402
-from cti_pipeline.model import aggregate, cross_validate, fit_and_score, make_splits  # noqa: E402
+from cti_pipeline.model import aggregate, cross_validate, fit_and_score  # noqa: E402
 
 
 def run_variant(name: str, X: pd.DataFrame, y: np.ndarray, cfg, splits, do_cv: bool) -> dict:
@@ -46,6 +47,35 @@ def run_variant(name: str, X: pd.DataFrame, y: np.ndarray, cfg, splits, do_cv: b
     return result
 
 
+def variant_designs(frame: pd.DataFrame, frame_live: pd.DataFrame
+                    ) -> tuple[pd.DataFrame, dict[str, pd.DataFrame]]:
+    """Build the four ablation designs; returns ``(X_all, {variant: X})``.
+
+    ``live_feeds_only`` deliberately **keeps** the CTI columns: the variant
+    answers "what do the public feeds alone buy us?", and its six CTI features
+    are the ones computed from live-feed sightings only (all zero unless a feed
+    actually returned the indicator).  Dropping them turned the variant into a
+    byte-for-byte copy of ``traffic_only``, so E2 fitted the traffic-only model
+    twice and published it as the live-feed result.
+    """
+    X_all, _ = build_design(frame, include_cti=True, cti_cols=CTI_FEATURES)
+    cti_cols = [c for c in CTI_FEATURES if c in X_all.columns]
+    X_traffic = X_all.drop(columns=cti_cols)
+    # feature-group ablation: how much of the gain is the IoC-match flag itself?
+    match_cols = [c for c in ("ioc_src_match", "ioc_dst_match") if c in X_all.columns]
+    X_cti_no_match = X_all.drop(columns=match_cols)
+
+    X_live, _ = build_design(frame_live, include_cti=True, cti_cols=CTI_FEATURES)
+    X_live_cti = X_live.reindex(columns=X_all.columns, fill_value=0.0)
+
+    return X_all, {
+        "traffic_only": X_traffic,
+        "traffic_cti": X_all,
+        "traffic_cti_no_match": X_cti_no_match,
+        "live_feeds_only": X_live_cti,
+    }
+
+
 def main() -> None:
     parser = base_parser("E2 - CTI ablation (RQ1/H1)")
     parser.add_argument("--no-poll", action="store_true", help="reuse feed snapshots")
@@ -56,26 +86,23 @@ def main() -> None:
     flows = get_flows(cfg, args.dataset)
     live = get_live_records(cfg, poll=not args.no_poll)
 
+    # split before enrichment: the injected IoC pool may only be built from
+    # train+val labels, never from the test split (target leakage).
+    splits, y, eligible = split_first(cfg, flows)
+
     # ---- variant A: controlled live-CTI enrichment (proposal's primary path)
-    frame, _, summary = build_enriched(cfg, flows, live, interval_min=cfg.cti.poll_interval_min)
-    X_all, y = build_design(frame, include_cti=True, cti_cols=CTI_FEATURES)
-    cti_cols = [c for c in CTI_FEATURES if c in X_all.columns]
-    X_cti_all = X_all[cti_cols]
-    X_traffic = X_all.drop(columns=cti_cols)
-    # feature-group ablation: how much of the gain is the IoC-match flag itself?
-    match_cols = [c for c in ("ioc_src_match", "ioc_dst_match") if c in X_all.columns]
-    X_cti_no_match = X_all.drop(columns=match_cols)
+    frame, _, summary = build_enriched(cfg, flows, live,
+                                       interval_min=cfg.cti.poll_interval_min,
+                                       eligible=eligible)
 
     # ---- variant B: live feeds only (no controlled injection) -------------
     frame_live, _, summary_live = build_enriched(cfg, flows, live,
                                                  interval_min=cfg.cti.poll_interval_min,
                                                  injection="none")
-    X_live, _ = build_design(frame_live, include_cti=True, cti_cols=CTI_FEATURES)
-    X_live_cti = X_live.reindex(columns=X_all.columns, fill_value=0.0)
-    X_live_only = X_live_cti.drop(
-        columns=[c for c in CTI_FEATURES if c in X_live_cti.columns])
 
-    splits = make_splits(y, cfg.data.test_size, cfg.data.val_size, cfg.model.seed)
+    X_all, variants = variant_designs(frame, frame_live)
+    X_traffic = variants["traffic_only"]
+
     print(f"[design] rows={len(y):,} features traffic={X_traffic.shape[1]} "
           f"+cti={X_all.shape[1]} | positives={int(y.sum()):,} "
           f"| CTI sightings={summary}")
@@ -90,12 +117,8 @@ def main() -> None:
         "variants": [],
     }
 
-    for name, X, do_cv in (
-        ("traffic_only", X_traffic, not args.skip_cv),
-        ("traffic_cti", X_all, not args.skip_cv),
-        ("traffic_cti_no_match", X_cti_no_match, not args.skip_cv),
-        ("live_feeds_only", X_live_only, False),
-    ):
+    for name, X in variants.items():
+        do_cv = not args.skip_cv
         print(f"[run] {name} ({X.shape[1]} features)", flush=True)
         results["variants"].append(run_variant(name, X, y, cfg, splits, do_cv))
 

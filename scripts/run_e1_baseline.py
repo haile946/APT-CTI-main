@@ -14,11 +14,14 @@ from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.linear_model import SGDClassifier
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _common import TABLES, base_parser, build_enriched, get_config, get_flows, get_live_records, write_json  # noqa: E402
+from _common import (  # noqa: E402
+    TABLES, base_parser, build_enriched, get_config, get_flows, get_live_records,
+    split_first, write_json,
+)
 
 from cti_pipeline.data import build_design  # noqa: E402
 from cti_pipeline.enrich import CTI_FEATURES  # noqa: E402
-from cti_pipeline.model import make_model, make_splits, metrics_at, tune_threshold  # noqa: E402
+from cti_pipeline.model import make_model, metrics_at, tune_threshold  # noqa: E402
 
 
 def comparators(cfg):
@@ -42,15 +45,18 @@ def main() -> None:
 
     flows = get_flows(cfg, args.dataset)
     live = get_live_records(cfg, poll=not args.no_poll)
+    # split first: the injected IoC pool may only come from train+val rows,
+    # otherwise test-split labels leak into the CTI features.
+    splits, y, eligible = split_first(cfg, flows)
     frame, _, summary = build_enriched(cfg, flows, live,
-                                       interval_min=cfg.cti.poll_interval_min)
+                                       interval_min=cfg.cti.poll_interval_min,
+                                       eligible=eligible)
     X_cti, y = build_design(frame, include_cti=True, cti_cols=CTI_FEATURES)
     cti_cols = [c for c in CTI_FEATURES if c in X_cti.columns]
     variants = {"traffic_only": X_cti.drop(columns=cti_cols)}
     if args.with_cti:
         variants["traffic_cti"] = X_cti
 
-    splits = make_splits(y, cfg.data.test_size, cfg.data.val_size, cfg.model.seed)
     rows = []
     for variant, X in variants.items():
         for key, (label, model) in comparators(cfg).items():

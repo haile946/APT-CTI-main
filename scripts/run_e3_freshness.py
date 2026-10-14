@@ -19,12 +19,12 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import (  # noqa: E402
     TABLES, base_parser, build_enriched, get_config, get_flows, get_live_records,
-    get_sightings, write_json,
+    get_sightings, split_first, write_json,
 )
 
 from cti_pipeline.data import build_design  # noqa: E402
 from cti_pipeline.enrich import CTI_FEATURES, coverage_stats  # noqa: E402
-from cti_pipeline.model import make_model, make_splits, metrics_at, tune_threshold  # noqa: E402
+from cti_pipeline.model import make_model, metrics_at, tune_threshold  # noqa: E402
 
 INTERVAL_LABELS = {1: "1 min", 5: "5 min", 60: "1 hr", 360: "6 hr", 1440: "24 hr"}
 
@@ -40,18 +40,22 @@ def main() -> None:
     flows = get_flows(cfg, args.dataset)
     live = get_live_records(cfg, poll=not args.no_poll)
 
-    # sightings are interval-independent: build once from the full traffic frame
-    sightings, summary = get_sightings(cfg, flows, live)
+    # split before enrichment: injected indicators come from train+val labels
+    # only, so test-split labels cannot leak into the CTI features.
+    splits, y, eligible = split_first(cfg, flows)
+
+    # sightings are interval-independent: build once, from the train+val rows
+    sightings, summary = get_sightings(cfg, flows, live, eligible=eligible)
     sight_pair = (sightings, summary)
 
     # reference: features produced at the configured 5-minute poll interval
     t0 = time.time()
     frame_ref, _, _ = build_enriched(
-        cfg, flows, live, interval_min=cfg.cti.poll_interval_min, sightings=sight_pair)
+        cfg, flows, live, interval_min=cfg.cti.poll_interval_min,
+        sightings=sight_pair, eligible=eligible)
     ref_enrich_s = time.time() - t0
 
     X, y = build_design(frame_ref, include_cti=True, cti_cols=CTI_FEATURES)
-    splits = make_splits(y, cfg.data.test_size, cfg.data.val_size, cfg.model.seed)
     print(f"[design] rows={len(y):,} features={X.shape[1]} "
           f"| sightings={summary} | enrich(ref)={ref_enrich_s:.1f}s")
 
@@ -68,7 +72,7 @@ def main() -> None:
     for interval in cfg.replay.intervals_min:
         t0 = time.time()
         frame_i, _, sum_i = build_enriched(cfg, flows, live, interval_min=interval,
-                                           sightings=sight_pair)
+                                           sightings=sight_pair, eligible=eligible)
         enrich_s = time.time() - t0
         X_i, _ = build_design(frame_i, include_cti=True, cti_cols=CTI_FEATURES)
         X_i = X_i.reindex(columns=X.columns, fill_value=0.0)

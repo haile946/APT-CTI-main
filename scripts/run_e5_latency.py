@@ -24,13 +24,13 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import (  # noqa: E402
     TABLES, base_parser, build_enriched, get_config, get_flows, get_live_records,
-    make_settings, write_json,
+    make_settings, split_first, write_json,
 )
 
 from cti_pipeline.data import build_design  # noqa: E402
 from cti_pipeline.enrich import CTI_FEATURES, enrich  # noqa: E402
 from cti_pipeline.explain import make_explainer, reason_codes, shap_matrix  # noqa: E402
-from cti_pipeline.model import fit_and_score, make_splits  # noqa: E402
+from cti_pipeline.model import fit_and_score  # noqa: E402
 
 WARMUP_BATCHES = 3
 TARGET_FLOWS = 10_000
@@ -62,11 +62,14 @@ def main() -> None:
 
     # ---- build the enriched frame and train ------------------------------
     flows = get_flows(cfg, args.dataset)
+    # split before enrichment: injected indicators come from train+val labels
+    # only, so the test split's own labels cannot leak into the CTI features.
+    splits, y, eligible = split_first(cfg, flows)
     frame, (sightings_map, _), summary = build_enriched(
-        cfg, flows, live, interval_min=cfg.cti.poll_interval_min)
+        cfg, flows, live, interval_min=cfg.cti.poll_interval_min,
+        eligible=eligible)
     X, y = build_design(frame, include_cti=True, cti_cols=CTI_FEATURES)
     columns = list(X.columns)
-    splits = make_splits(y, cfg.data.test_size, cfg.data.val_size, cfg.model.seed)
     print(f"[design] rows={len(y):,} features={X.shape[1]}", flush=True)
 
     print("[train] fitting model + theta ...", flush=True)

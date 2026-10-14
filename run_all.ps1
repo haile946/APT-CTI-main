@@ -24,8 +24,30 @@ function Step($name, $script, $argList) {
     Write-Host $done
 }
 
+# Self-contained suites (no dataset, no network). A failure means the result
+# tables this run would produce are not trustworthy, so stop immediately.
+function Gate($name, $rel) {
+    $line = "=== $name === $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+    Add-Content -Path $log -Value ""
+    Add-Content -Path $log -Value $line
+    Write-Host $line
+    & $py (Join-Path $root $rel) 2>&1 | Add-Content -Path $log
+    if ($null -ne $LASTEXITCODE -and $LASTEXITCODE -ne 0) {
+        $fail = "--- $name FAILED (exit $LASTEXITCODE); aborting before any experiment ---"
+        Add-Content -Path $log -Value $fail
+        Write-Host $fail
+        exit $LASTEXITCODE
+    }
+    $ok = "--- $name passed ---"
+    Add-Content -Path $log -Value $ok
+    Write-Host $ok
+}
+
 Set-Content -Path $log -Value "run_all started $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
 Write-Host "run_all: datasets = $($Datasets -join ', ')"
+
+Gate 'verify-leakage'   'tests\test_leakage.py'
+Gate 'verify-hardening' 'deploy\test_hardening.py'
 
 Step 'feeds-poll' 'run_collect_feeds.py' @()
 

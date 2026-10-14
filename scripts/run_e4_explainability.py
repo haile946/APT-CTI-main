@@ -19,7 +19,8 @@ from sklearn.model_selection import StratifiedKFold, train_test_split
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import (  # noqa: E402
-    ROOT, TABLES, base_parser, build_enriched, get_config, get_flows, get_live_records, write_json,
+    ROOT, TABLES, base_parser, build_enriched, get_config, get_flows, get_live_records,
+    split_first, write_json,
 )
 
 from cti_pipeline.data import build_design  # noqa: E402
@@ -28,7 +29,7 @@ from cti_pipeline.explain import (  # noqa: E402
     explain_alerts, global_ranking, make_explainer, ranking_strength, shap_matrix,
     tactic_distribution, tactic_stability, top_k_jaccard,
 )
-from cti_pipeline.model import make_model, make_splits, metrics_at, tune_threshold  # noqa: E402
+from cti_pipeline.model import make_model, metrics_at, tune_threshold  # noqa: E402
 
 
 def main() -> None:
@@ -40,11 +41,14 @@ def main() -> None:
 
     flows = get_flows(cfg, args.dataset)
     live = get_live_records(cfg, poll=not args.no_poll)
+    # split first: injected indicators may only come from train+val labels,
+    # otherwise the test split's own labels leak into the CTI features.
+    splits, y, eligible = split_first(cfg, flows)
     frame, _, summary = build_enriched(cfg, flows, live,
-                                       interval_min=cfg.cti.poll_interval_min)
+                                       interval_min=cfg.cti.poll_interval_min,
+                                       eligible=eligible)
     X, y = build_design(frame, include_cti=True, cti_cols=CTI_FEATURES)
     columns = list(X.columns)
-    splits = make_splits(y, cfg.data.test_size, cfg.data.val_size, cfg.model.seed)
     trainval = np.concatenate([splits.train, splits.val])
     print(f"[design] rows={len(y):,} features={len(columns)}")
 

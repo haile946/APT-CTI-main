@@ -214,6 +214,17 @@ Historical benchmark addresses (2017-era) typically do not appear in today’s p
 
 E2 always reports both a CTI-enhanced row and a `live_feeds_only` baseline so the gap between emulation and live-feed reality cannot be hidden. Details: [`docs/METHODOLOGY.md`](docs/METHODOLOGY.md).
 
+### Leakage control on injected indicators
+
+Because injected indicators are derived from ground truth, they must never be built from the labels the model is scored on:
+
+- the train/validation/test split is computed **before** enrichment;
+- only **train + validation** rows may contribute injected IPs, sighting timestamps, synthetic confidence, and benign-noise IPs — test-split labels never enter the indicator pool;
+- `_common.get_sightings()` raises if a caller omits that restriction, so the leak cannot be reintroduced silently;
+- a flow is only affected by poll boundaries **strictly earlier** than its own timestamp, so no flow can be flagged by its own sighting.
+
+`tests/test_leakage.py` covers all four (10 checks). The `live_feeds_only` variant is likewise required to keep the six CTI columns — it is traffic plus the CTI features that *live feeds alone* provide, not a second copy of the traffic-only model.
+
 ### Operating point
 
 Classification thresholds are **not** fixed at 0.5. For each model, θ is selected on the validation split as the largest threshold that still meets `model.target_recall` (default **0.96**). E2 compares FPR **at matched recall**.
@@ -229,6 +240,8 @@ IoC sightings become visible at the next poll boundary after the indicator is ob
 Full tables, figures, and verdicts: [`docs/RESULTS.md`](docs/RESULTS.md).  
 Machine-readable outputs: `results/tables/`, `results/figures/`, `results/alerts/`.
 
+> **Provenance of the numbers below.** The committed result tables were produced by the pipeline **before** the leakage fixes described above (the injected indicator pool was built from the whole labelled frame, test rows included). They are therefore an **upper bound** on what the corrected pipeline achieves. Regenerating `results/tables/` with the fixed code will revise these figures; until that re-run, read every headline number as provisional.
+
 ### H1 — CTI reduces FPR at matched recall (E2)
 
 | Dataset | Traffic-only FPR (CV) | +CTI FPR (CV) | Relative reduction | Split-test reduction |
@@ -236,7 +249,7 @@ Machine-readable outputs: `results/tables/`, `results/figures/`, `results/alerts
 | UNSW-NB15 | 0.377 % | 0.365 % | **3.2 %** | **11.7 %** |
 | CIC-IDS2017 | 0.0646 % | 0.0016 % | **97.6 %** | **97.4 %** |
 
-`live_feeds_only` (traffic-only under today’s feeds) shows ~0 indicator overlap with 2017-era benchmarks and no gain — the controlled-injection numbers are an **upper-bound-style** estimate under documented coverage, not a claim of live-feed performance on historical labels.
+`live_feeds_only` (traffic plus the six CTI features computed from **today’s feeds alone**) shows ~0 indicator overlap with 2017-era benchmarks and no gain — the controlled-injection numbers are an **upper-bound-style** estimate under documented coverage, not a claim of live-feed performance on historical labels.
 
 ### H2 — Freshness (E3)
 
@@ -303,7 +316,7 @@ If you use this artefact in academic work, please cite the thesis title:
 
 ## Ethical and validity notes
 
-1. **Controlled injection is label-derived** and can overstate live-feed gains; always read `live_feeds_only` alongside injected rows.  
+1. **Controlled injection is label-derived** and can overstate live-feed gains; always read `live_feeds_only` alongside injected rows. The indicator pool is restricted to train+validation rows (see *Leakage control* above), so test labels cannot influence the features the model is scored on.  
 2. Neither public benchmark provides ground-truth **APT actor** labels; attribution is evidence-based candidate ranking, not a supervised actor classifier.  
 3. Public CTI feeds change over time; historical reproduction may differ from live runs.  
 4. This artefact is for **research and defensive evaluation**. Do not use it to attack systems you do not own or are not authorised to test.

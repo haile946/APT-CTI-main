@@ -34,10 +34,12 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from _common import TABLES, build_enriched, get_config, get_flows, get_live_records  # noqa: E402
+from _common import (  # noqa: E402
+    TABLES, build_enriched, get_config, get_flows, get_live_records, split_first,
+)
 from cti_pipeline.data import DROP_FROM_FEATURES, build_design  # noqa: E402
 from cti_pipeline.enrich import CTI_FEATURES  # noqa: E402
-from cti_pipeline.model import make_splits, make_model, tune_threshold, metrics_at  # noqa: E402
+from cti_pipeline.model import make_model, tune_threshold, metrics_at  # noqa: E402
 
 MODEL_DIR = ROOT / "model"
 
@@ -108,8 +110,13 @@ def main() -> None:
     t0 = time.time()
     flows = get_flows(cfg, "unsw_nb15")
     live = get_live_records(cfg, poll=not args.no_poll)
+    # split before enrichment: the injected IoC pool may only come from
+    # train+val labels, otherwise the bundle's CTI features are partly a
+    # function of the test labels it is scored on.
+    splits, _, eligible = split_first(cfg, flows)
     frame, _, summary = build_enriched(
-        cfg, flows, live, interval_min=cfg.cti.poll_interval_min)
+        cfg, flows, live, interval_min=cfg.cti.poll_interval_min,
+        eligible=eligible)
     print(f"[train] enriched {len(frame):,} flows in {time.time()-t0:.0f}s; "
           f"sightings: {summary}", flush=True)
 
@@ -119,8 +126,6 @@ def main() -> None:
                and c not in CTI_FEATURES]
     frame = add_derived(frame)
 
-    splits = make_splits(frame["label"].to_numpy(), cfg.data.test_size,
-                         cfg.data.val_size, cfg.model.seed)
     results: dict[str, dict] = {}
 
     for name in profiles:
@@ -169,6 +174,7 @@ def main() -> None:
                 "seed": int(cfg.model.seed),
                 "interval_min": cfg.cti.poll_interval_min,
                 "injection": cfg.replay.injection,
+                "indicator_pool": "train_val_only",   # test labels excluded
                 "fit_seconds": round(fit_s, 1),
                 "trained_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                 "test_metrics": test_m,

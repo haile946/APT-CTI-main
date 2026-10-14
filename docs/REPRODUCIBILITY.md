@@ -186,13 +186,17 @@ python serve.py --interval 60
 
 ---
 
-## 9. Scoring service smoke test
+## 9. Verification suites
 
 ```bash
-python deploy/test_service.py
+python deploy/test_service.py     # end-to-end service smoke test (needs processed data)
+python deploy/test_hardening.py   # 51 checks: path/auth, tailer, crash + sink resilience
+python tests/test_leakage.py      # 10 checks: split-restricted injection, causality, E2 variants
 # Docker:
 docker build -t apt-cti-scorer .
 ```
+
+`deploy/test_hardening.py` and `tests/test_leakage.py` are self-contained (no dataset, no network) and exit non-zero on any failure; run both before publishing numbers.
 
 Production notes: [`deploy/README.md`](../deploy/README.md).
 
@@ -232,6 +236,9 @@ Wall-clock varies with CPU and disk.
 - [ ] `config/default.yaml` matches the reported `max_rows`, seeds, and injection rates  
 - [ ] Datasets present under documented paths  
 - [ ] `results/tables/*.json` regenerated in the same session  
+- [ ] Tables regenerated **after** the leakage fix (injected indicator pool built from train+validation rows only — see [`METHODOLOGY.md`](METHODOLOGY.md) §4.4)  
+- [ ] `python tests/test_leakage.py` passes 10/10  
+- [ ] `python deploy/test_hardening.py` passes 51/51  
 - [ ] `live_feeds_only` rows present alongside injected CTI rows  
 - [ ] `scripts/status_report.py` output archived  
-- [ ] Thesis text quotes the same verdicts as [`RESULTS.md`](RESULTS.md)  
+- [ ] Thesis text quotes the same verdicts as [`RESULTS.md`](RESULTS.md)   
