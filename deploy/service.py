@@ -143,41 +143,116 @@ class Bundle:
 
 
 class FileTailer:
-    def __init__(self, path: Path, fmt: str, start_at_end: bool):
+    """Byte-accurate tail reader.
+
+    Three properties matter for an unattended sensor:
+
+    * **truncation/rotation** - if the file shrinks (``logrotate
+      copytruncate``) or is replaced (rename + recreate), the old byte offset
+      would land past EOF and ``read()`` would return nothing forever while
+      the service still reported healthy.  Both cases are detected and the
+      read restarts at byte 0.
+    * **partial lines** - a record split across two reads is never consumed
+      and lost.  The fragment is held back and prepended to the next read, so
+      it is parsed exactly once, whole.  A fragment that already parses as a
+      complete record is flushed immediately (that is how a file ending
+      without a trailing newline still yields its last row).
+    * **parse_errors** - decode/format failures are counted through the
+      service's stats dict instead of being dropped silently.
+    """
+
+    MAX_PENDING = 1_048_576          # give up holding a runaway fragment
+
+    def __init__(self, path: Path, fmt: str, start_at_end: bool,
+                 stats: dict | None = None):
         self.path, self.fmt = path, fmt
+        self.stats = stats if stats is not None else {}
         self.pos = 0
+        self._pending = b""
+        self._ident: tuple[int, int] | None = None
+        self.resets = 0
         self.zeek_fields = ""
+        self.csv_header = ""
         if not path.exists():
             path.parent.mkdir(parents=True, exist_ok=True)
             path.touch()
-        with path.open("r", encoding="utf-8", errors="replace") as fh:
-            head = fh.read(65536)
+        with path.open("rb") as fh:
+            head = fh.read(65536).decode("utf-8", errors="replace")
             if fmt == "zeek":
                 for line in head.splitlines():
                     if line.startswith("#fields"):
                         self.zeek_fields = line
             if fmt == "csv":
                 self.csv_header = head.splitlines()[0] if head else ""
-            else:
-                self.csv_header = ""
-            if start_at_end:
-                fh.seek(0, 2)
-            else:
-                fh.seek(0)
+            fh.seek(0, 2 if start_at_end else 0)
             self.pos = fh.tell()
+            self._ident = self._identity(fh)
+
+    @staticmethod
+    def _identity(fh) -> tuple[int, int]:
+        st = os.fstat(fh.fileno())
+        return int(st.st_dev), int(st.st_ino)
+
+    def _count(self) -> None:
+        self.stats["parse_errors"] = int(self.stats.get("parse_errors", 0)) + 1
 
     def read(self) -> list[dict]:
-        with self.path.open("r", encoding="utf-8", errors="replace") as fh:
-            fh.seek(self.pos)
-            text = fh.read()
-            self.pos = fh.tell()
-        if not text:
+        try:
+            with self.path.open("rb") as fh:
+                size = os.fstat(fh.fileno()).st_size
+                ident = self._identity(fh)
+                replaced = (self._ident is not None and ident != (0, 0)
+                            and self._ident != (0, 0) and ident != self._ident)
+                if size < self.pos or replaced:
+                    # truncated or rotated away: restart from the top rather
+                    # than seeking past EOF and stalling silently forever.
+                    self.resets += 1
+                    self.stats["tail_resets"] = self.resets
+                    print(f"[service] input {self.path.name} truncated/rotated "
+                          f"(size {size} < pos {self.pos}, replaced={replaced}) "
+                          f"-> restart at 0", flush=True)
+                    self.pos, self._pending = 0, b""
+                self._ident = ident
+                fh.seek(self.pos)
+                data = fh.read()
+                end = fh.tell()
+        except OSError:
+            return []                      # transient lock by the writer
+        if not data and not self._pending:
             return []
+
+        buf = self._pending + data
+        nl = buf.rfind(b"\n")
+        if buf.endswith(b"\n"):
+            complete, rest = buf, b""
+        elif nl >= 0:
+            complete, rest = buf[:nl + 1], buf[nl + 1:]
+        else:
+            complete, rest = b"", buf
+
+        # a newline-less fragment that already parses as a whole record is
+        # flushed now (EOF / writer paused after a complete record)
+        if rest and len(rest) > self.MAX_PENDING:
+            self._count()
+            complete, rest = complete + rest, b""
+        elif rest and fa.is_complete(rest.decode("utf-8", errors="replace"),
+                                     self.fmt, self.csv_header):
+            complete, rest = complete + rest, b""
+
+        self._pending = rest
+        self.pos = end                # all bytes < pos have been read into
+        #                                memory; _pending holds the not-yet-
+        #                                emitted tail of them.  Rewinding pos
+        #                                over _pending would re-read those
+        #                                bytes and emit the record twice.
+        if not complete:
+            return []
+        text = complete.decode("utf-8", errors="replace")
         if self.fmt == "zeek" and "#fields" not in text:
             text = (self.zeek_fields + "\n" + text) if self.zeek_fields else text
         if self.fmt == "csv" and self.csv_header and "," not in text.split("\n", 1)[0]:
             text = self.csv_header + "\n" + text
-        return fa.parse_chunk(text, self.fmt)
+        return fa.parse_chunk(text, self.fmt, self.stats)
 
 
 class FeedWorker(threading.Thread):
@@ -257,7 +332,20 @@ class Service:
         inpath = resolve(args.input or cfg["input"]["path"])
         fmt = fa.detect_format(inpath, args.format or cfg["input"]["format"])
         start_end = cfg["input"]["start_at_end"] and not args.replay
-        self.tailer = FileTailer(inpath, fmt, start_end)
+        # stats first: FileTailer increments parse_errors through this dict
+        self.stats = {
+            "started_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "flows_scored": 0, "batches": 0, "alerts": 0,
+            "parse_errors": 0, "tail_resets": 0,
+            "score_errors": 0, "emit_errors": 0,
+            "last_error": None, "last_batch_at": None,
+            "input": str(inpath), "format": fmt,
+            "profile": self.bundle.profile, "theta": self.bundle.theta,
+            "n_features": len(self.bundle.features),
+        }
+        self.stats["web"] = (f"http://{self.cfg['health']['host']}:"
+                             f"{self.cfg['health']['port']}/")
+        self.tailer = FileTailer(inpath, fmt, start_end, self.stats)
         self.feeds = FeedWorker(cfg["feeds"])
         sink_list: list = []
         if cfg["alerts"].get("jsonl"):
@@ -277,16 +365,6 @@ class Service:
                                            int(cfg["alerts"].get("syslog_port", 514))))
         self.sink = sk.Fanout(sink_list)
         self.buffer: list[dict] = []
-        self.stats = {
-            "started_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "flows_scored": 0, "batches": 0, "alerts": 0,
-            "parse_errors": 0, "last_batch_at": None,
-            "input": str(inpath), "format": fmt,
-            "profile": self.bundle.profile, "theta": self.bundle.theta,
-            "n_features": len(self.bundle.features),
-        }
-        self.stats["web"] = (f"http://{self.cfg['health']['host']}:"
-                             f"{self.cfg['health']['port']}/")
         self.batch_id = 0
         self.sid = datetime.now(timezone.utc).strftime("%y%m%d-%H%M%S")
         self.xai = xa.NvidiaExplainer(cfg.get("xai"))
@@ -403,16 +481,26 @@ class Service:
                 },
                 "reasons": codes,
             }
-            if self.attributor is not None:
-                att = self.attributor.attribute(alert)
-                alert["attribution"] = att
-                if att.get("notify"):
-                    self.stats["apt_notified"] += 1
-                    self._audit("apt_notify", alert_id=alert["alert_id"],
-                                actor=(att.get("actor") or {}).get("name", ""),
-                                mitre_id=(att.get("actor") or {}).get("mitre_id") or "",
-                                confidence=att.get("confidence", 0))
-            self.sink.emit(alert)
+            try:
+                if self.attributor is not None:
+                    att = self.attributor.attribute(alert)
+                    alert["attribution"] = att
+                    if att.get("notify"):
+                        self.stats["apt_notified"] += 1
+                        self._audit("apt_notify", alert_id=alert["alert_id"],
+                                    actor=(att.get("actor") or {}).get("name", ""),
+                                    mitre_id=(att.get("actor") or {}).get("mitre_id") or "",
+                                    confidence=att.get("confidence", 0))
+                self.sink.emit(alert)
+            except Exception as exc:                      # noqa: BLE001
+                # one bad alert (sink down, attribution fetch failed) must
+                # not abort the batch or take the service down with it
+                self.stats["emit_errors"] += 1
+                self.stats["last_error"] = f"alert emit failed: {exc}"[:200]
+                self._audit("alert_emit_error", alert_id=alert["alert_id"],
+                            error=str(exc)[:200])
+                print(f"[service] alert {alert['alert_id']} emit failed: {exc}",
+                      flush=True)
         self.stats["alerts"] += len(alert_idx)
         self.stats["alerts_jsonl"] = self.jsonl.count if self.jsonl else 0
         t4 = time.perf_counter()
@@ -598,6 +686,7 @@ class Service:
         return {
             **self.stats,
             "model": self.model_card,
+            "sinks": self.sink.stats(),
             "feed_records": self.feeds.n_records,
             "feed_mode": "online" if self.cfg["feeds"]["online"] else "offline",
             "feed_sources": list(self.feeds.last_polls),
@@ -612,6 +701,21 @@ class Service:
             "build": getattr(vw, "BUILD", ""),
             "alive": True,
         }
+
+    def _score_safe(self, chunk: list[dict]) -> None:
+        """Score a batch without letting an exception escape.
+
+        An unhandled error here would propagate out of ``run()`` and exit the
+        process; the tailer has already advanced past the chunk, so the flows
+        would be dropped without a trace.  Log, audit, carry on.
+        """
+        try:
+            self.score_batch(chunk)
+        except Exception as exc:                          # noqa: BLE001
+            self.stats["score_errors"] += 1
+            self.stats["last_error"] = f"batch failed: {exc}"[:200]
+            self._audit("score_error", n_flows=len(chunk), error=str(exc)[:300])
+            print(f"[service] batch of {len(chunk)} flows failed: {exc}", flush=True)
 
     def run(self) -> None:
         ensure_doh()
@@ -633,29 +737,45 @@ class Service:
 
         if self.args.replay:
             while True:
-                recs = self.tailer.read()
+                try:
+                    recs = self.tailer.read()
+                except Exception as exc:                  # noqa: BLE001
+                    self.stats["score_errors"] += 1
+                    self.stats["last_error"] = f"tail failed: {exc}"[:200]
+                    print(f"[service] tail failed: {exc}", flush=True)
+                    break
                 if not recs:
                     break
                 for i in range(0, len(recs), max_flows):
-                    self.score_batch(recs[i:i + max_flows])
+                    self._score_safe(recs[i:i + max_flows])
             print(f"[service] replay done: {self.stats['flows_scored']} flows, "
                   f"{self.stats['alerts']} alerts", flush=True)
             return
 
         while not self._stop.is_set():
-            self.buffer.extend(self.tailer.read())
+            try:
+                self.buffer.extend(self.tailer.read())
+            except Exception as exc:                      # noqa: BLE001
+                self.stats["score_errors"] += 1
+                self.stats["last_error"] = f"tail failed: {exc}"[:200]
+                print(f"[service] tail failed: {exc}", flush=True)
+                time.sleep(1.0)                           # avoid a hot spin
             now = time.time()
             if len(self.buffer) >= max_flows or (
                     self.buffer and now - last_flush >= flush_s):
                 n = (len(self.buffer) // max_flows) * max_flows or len(self.buffer)
                 chunk, self.buffer = self.buffer[:n], self.buffer[n:]
-                self.score_batch(chunk)
+                self._score_safe(chunk)
                 last_flush = now
             time.sleep(0.25)
 
     def stop(self) -> None:
         self._stop.set()
         self.feeds.stop_evt.set()
+        try:
+            self.sink.close()               # drain the async webhook queue
+        except Exception:                                   # noqa: BLE001
+            pass
         if self._health:
             self._health.shutdown()
 
@@ -681,6 +801,14 @@ def main() -> None:
     except KeyboardInterrupt:
         svc.stop()
         print(f"\n[service] stopped: {svc.status()}", flush=True)
+    except Exception as exc:                          # noqa: BLE001
+        # a fatal escape hatch still shuts the sinks down and says why,
+        # instead of leaving a bare traceback after a silent partial run
+        svc.stop()
+        print(f"\n[service] FATAL: {exc}", file=sys.stderr, flush=True)
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -125,10 +125,16 @@ def _derive(rec: dict) -> dict:
     return rec
 
 
-def from_jsonl_line(line: str) -> dict | None:
+def from_jsonl_line(line: str, stats: dict | None = None) -> dict | None:
     try:
         obj = json.loads(line)
     except (json.JSONDecodeError, ValueError):
+        if stats is not None:
+            stats["parse_errors"] = int(stats.get("parse_errors", 0)) + 1
+        return None
+    if not isinstance(obj, dict):
+        if stats is not None:
+            stats["parse_errors"] = int(stats.get("parse_errors", 0)) + 1
         return None
     return _from_generic(obj)
 
@@ -176,16 +182,58 @@ def _from_generic(obj: dict) -> dict | None:
     return _derive(rec)
 
 
-def from_csv_rows(text: str) -> list[dict]:
+def from_csv_rows(text: str, stats: dict | None = None) -> list[dict]:
     out = []
-    for row in csv.DictReader(io.StringIO(text)):
+    reader = csv.DictReader(io.StringIO(text))
+    n_hdr = len(reader.fieldnames or [])
+    for row in reader:
+        # a row cut short by the writer would otherwise be coerced into a
+        # fabricated flow of zeros (or an over-long row into shifted columns)
+        if None in row or (n_hdr and any(v is None for v in row.values())):
+            if stats is not None:
+                stats["parse_errors"] = int(stats.get("parse_errors", 0)) + 1
+            continue
         rec = _from_generic(row)
         if rec:
             out.append(rec)
     return out
 
 
-def from_zeek(text: str) -> list[dict]:
+def is_complete(buf: str, fmt: str, csv_header: str = "") -> bool:
+    """True when ``buf`` is a whole, parseable record with no trailing newline.
+
+    The tailer uses this to decide whether a newline-less fragment should be
+    flushed (the file ends, or the writer paused after a complete record) or
+    held back (the writer is still in the middle of the record).  Returning
+    False for a truncated record is what prevents a half-written row from
+    being scored as a flow of zeros.
+    """
+    if not buf.strip():
+        return False
+    if fmt in ("jsonl", "eve", "auto"):
+        try:
+            obj = json.loads(buf)
+        except (json.JSONDecodeError, ValueError):
+            return False
+        return isinstance(obj, dict)
+    if fmt == "csv":
+        try:
+            row = next(csv.reader([buf]))
+        except (csv.Error, StopIteration):
+            return False
+        if csv_header:
+            try:
+                n_hdr = len(next(csv.reader([csv_header])))
+            except csv.Error:
+                n_hdr = 0
+            return bool(n_hdr) and len(row) >= n_hdr
+        return bool(row)
+    if fmt == "zeek":
+        return "\t" in buf
+    return True
+
+
+def from_zeek(text: str, stats: dict | None = None) -> list[dict]:
     """Parse a Zeek conn.log block (with ``#fields`` header)."""
     fields: list[str] = []
     out: list[dict] = []
@@ -198,6 +246,8 @@ def from_zeek(text: str) -> list[dict]:
         if line.startswith("#"):
             continue
         if not fields:
+            if stats is not None:            # data without a #fields header
+                stats["parse_errors"] = int(stats.get("parse_errors", 0)) + 1
             continue
         parts = line.split("\t")
         if len(parts) < len(fields):
@@ -224,11 +274,19 @@ def from_zeek(text: str) -> list[dict]:
     return out
 
 
-def from_eve_line(line: str) -> dict | None:
+def from_eve_line(line: str, stats: dict | None = None) -> dict | None:
     """Parse one Suricata eve.json line (flow / netflow events only)."""
     try:
         obj = json.loads(line)
     except (json.JSONDecodeError, ValueError):
+        if stats is not None:                    # malformed line
+            stats["parse_errors"] = int(stats.get("parse_errors", 0)) + 1
+        return None
+    if not isinstance(obj, dict) or "event_type" not in obj:
+        # a valid eve.json record always carries event_type; its absence
+        # means the input is not eve.json (wrong --format)
+        if stats is not None:
+            stats["parse_errors"] = int(stats.get("parse_errors", 0)) + 1
         return None
     etype = obj.get("event_type", "")
     if etype not in ("flow", "netflow"):
@@ -268,23 +326,29 @@ def from_eve_line(line: str) -> dict | None:
     return _derive(rec)
 
 
-def parse_chunk(text: str, fmt: str) -> list[dict]:
-    """Parse a text chunk (new data read from the tail) into canonical records."""
+def parse_chunk(text: str, fmt: str, stats: dict | None = None) -> list[dict]:
+    """Parse a text chunk (new data read from the tail) into canonical records.
+
+    ``stats`` (the service's counters dict) receives ``parse_errors`` for lines
+    that could not be parsed at all - decode failures, ragged CSV rows, Zeek
+    data with no ``#fields`` header.  Records that are valid but are not flows
+    (e.g. a Suricata ``dns`` event) are skipped silently and are not errors.
+    """
     if not text:
         return []
     if fmt == "csv":
-        return from_csv_rows(text)
+        return from_csv_rows(text, stats)
     if fmt == "zeek":
-        return from_zeek(text)
+        return from_zeek(text, stats)
     out: list[dict] = []
     for line in text.splitlines():
         line = line.strip()
         if not line:
             continue
         if fmt == "eve":
-            rec = from_eve_line(line)
+            rec = from_eve_line(line, stats)
         else:
-            rec = from_jsonl_line(line)
+            rec = from_jsonl_line(line, stats)
         if rec:
             out.append(rec)
     return out

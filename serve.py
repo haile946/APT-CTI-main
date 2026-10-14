@@ -4,16 +4,24 @@
     python serve.py --no-poll        # serve only (browser still auto-reloads)
     python serve.py --full           # also rerun the whole pipeline hourly
     python serve.py --port 9000 --interval 60
+    python serve.py --host 0.0.0.0 --token SECRET   # remote access (required)
 
 The page shows a live badge and reloads itself whenever dashboard/index.html
 changes (feed poll -> rebuild -> reload).  Ctrl+C stops the server.
+
+Security: only the directories in SAFE_ROOTS are served.  ``.git/``, config
+files, model bundles and source code are never exposed.  Binding a non-loopback
+address requires ``--token`` (or APT_SERVE_TOKEN); /__status then demands it.
 """
 
 from __future__ import annotations
 
 import argparse
+import hmac
+import ipaddress
 import json
 import mimetypes
+import os
 import subprocess
 import sys
 import threading
@@ -22,12 +30,20 @@ import webbrowser
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 ROOT = Path(__file__).resolve().parent
 DASHBOARD = ROOT / "dashboard" / "index.html"
 TABLES = ROOT / "results" / "tables"
 SNAPSHOT = ROOT / "data" / "feed_snapshots" / "last_poll.json"
+
+# The only trees reachable over HTTP.  Everything else (.git, config/*.yaml,
+# model/*.joblib, src/, ...) is served as 404 regardless of path.
+SAFE_ROOTS: tuple[Path, ...] = (
+    ROOT / "dashboard",
+    ROOT / "results",
+    ROOT / "data" / "feed_snapshots",
+)
 
 STATE: dict = {"busy": False, "last_error": None, "next_poll_in": None}
 ARGS: argparse.Namespace
@@ -68,8 +84,25 @@ LIVE_SNIPPET = b"""
     window.__gen = s.gen;
   }
   function tick(){
-    fetch('/__status', {cache:'no-store'}).then(function(r){ return r.json(); })
-      .then(render).catch(function(){
+    var hdrs = {cache:'no-store'};
+    var t = '';
+    try {
+      var m = location.search.match(/[?&]token=([^&]+)/);
+      if (m) { sessionStorage.setItem('apt_token', decodeURIComponent(m[1])); }
+      t = sessionStorage.getItem('apt_token') || '';
+    } catch (e) { t = ''; }
+    if (t) hdrs.headers = {'X-Auth-Token': t};
+    fetch('/__status', hdrs).then(function(r){
+      if (r.status === 401) {
+        el.innerHTML = '<span style="color:#ff6961;margin-right:6px">&#9679;</span>'
+          + '<b>locked</b> &middot; append ?token=YOUR_TOKEN to the URL';
+        el.style.opacity = '1';
+        return null;
+      }
+      return r.json();
+    }).then(function(s){
+      if (s) render(s);
+    }).catch(function(){
         el.innerHTML = '<span style="color:#ff6961;margin-right:6px">&#9679;</span><b>offline</b> &middot; server unreachable';
         el.style.opacity = '1';
       });
@@ -123,11 +156,31 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
         self.end_headers()
         try:
             self.wfile.write(body)
         except (BrokenPipeError, ConnectionResetError):
             pass
+
+    def _authed(self) -> bool:
+        """Token check (constant-time). No token configured -> open."""
+        token = getattr(ARGS, "token", "") or ""
+        if not token:
+            return True
+        got = ""
+        auth_h = self.headers.get("Authorization", "")
+        if auth_h.startswith("Bearer "):
+            got = auth_h[7:].strip()
+        if not got:
+            got = (self.headers.get("X-Auth-Token") or "").strip()
+        if not got:
+            got = (parse_qs(urlsplit(self.path).query).get("token") or [""])[0]
+        try:
+            return bool(got) and hmac.compare_digest(got, token)
+        except TypeError:                      # non-ASCII -> fail closed
+            return False
 
     def do_GET(self) -> None:  # noqa: N802
         path = unquote(urlsplit(self.path).path)
@@ -144,12 +197,19 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, html, "text/html; charset=utf-8")
             return
         if path == "/__status":
+            if not self._authed():
+                self._send(401, b'{"error":"auth required"}', "application/json")
+                return
             self._send(200, json.dumps(status_payload()).encode("utf-8"),
                        "application/json")
             return
 
+        if not self._authed():
+            self._send(401, b'{"error":"auth required"}', "application/json")
+            return
+        # allowlist: never serve .git/, configs, models or source
         target = (ROOT / path.lstrip("/")).resolve()
-        if not target.is_relative_to(ROOT) or not target.is_file():
+        if not any(target.is_relative_to(s) for s in SAFE_ROOTS) or not target.is_file():
             self._send(404, b"not found", "text/plain; charset=utf-8")
             return
         ctype = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
@@ -210,6 +270,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="live mode for the thesis dashboard")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8747)
+    parser.add_argument("--token", default=os.environ.get("APT_SERVE_TOKEN", ""),
+                        help="access token required on /__status and static "
+                             "files (default: $APT_SERVE_TOKEN; mandatory when "
+                             "--host is not loopback)")
     parser.add_argument("--interval", type=int, default=300,
                         help="seconds between feed polls (default 300)")
     parser.add_argument("--no-poll", action="store_true",
@@ -220,6 +284,18 @@ def main() -> None:
                         help="seconds between full pipeline runs (default 3600)")
     parser.add_argument("--no-browser", action="store_true")
     ARGS = parser.parse_args()
+
+    # fail closed: a non-loopback bind must carry a token, otherwise anyone
+    # reaching the port can read the dashboard and its results.
+    try:
+        exposed = not ipaddress.ip_address(ARGS.host).is_loopback
+    except ValueError:
+        exposed = ARGS.host not in ("localhost", "127.0.0.1", "::1")
+    if exposed and not ARGS.token:
+        print(f"ERROR: refusing to bind non-loopback address {ARGS.host!r} "
+              "without a token - pass --token or set APT_SERVE_TOKEN "
+              "(or keep --host 127.0.0.1)", file=sys.stderr)
+        sys.exit(2)
 
     try:
         server = ExclusiveServer((ARGS.host, ARGS.port), Handler)
